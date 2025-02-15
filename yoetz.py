@@ -12,6 +12,10 @@ from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes, ConversationHandler, CommandHandler
 import email
 import openpyxl
+from dotenv import load_dotenv
+
+# טעינת משתני סביבה
+load_dotenv()
 
 # הגדרות וקבועים
 SCOPES = [
@@ -20,13 +24,20 @@ SCOPES = [
     'https://www.googleapis.com/auth/gmail.modify'
 ]
 
-CREDENTIALS_FILE = 'credentials/credentials.json'  # נתיב יחסי
+# נתיבים לקבצים
+CREDENTIALS_FILE = os.getenv('GOOGLE_CREDENTIALS_PATH', 'credentials/credentials.json')
 TOKEN_FILE = 'token.json'
 QUESTIONS_FILE = "questions.xlsx"
 
-# פונקציות עזר
+# קבועים לניהול שיחה
+QUESTION, QUESTION_TITLE = range(2)
+
+# מבני נתונים גלובליים
+reminders = {}
+user_questions = {}
+
 def create_message(sender, to, subject, body):
-    message = MIMEText(body)
+    message = MIMEText(body, 'plain', 'utf-8')
     message['to'] = to
     message['from'] = sender
     message['subject'] = subject
@@ -35,10 +46,10 @@ def create_message(sender, to, subject, body):
 def send_message(service, sender, message):
     try:
         message = service.users().messages().send(userId=sender, body=message).execute()
-        print(f"Message sent to {sender}")
+        print(f"Message sent to {message['to']}")
         return message
     except Exception as error:
-        print(f"An error occurred: {error}")
+        print(f"An error occurred while sending message: {error}")
         return None
 
 def authenticate_gmail_api():
@@ -50,6 +61,8 @@ def authenticate_gmail_api():
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
+            if not os.path.exists(CREDENTIALS_FILE):
+                raise FileNotFoundError(f"Missing credentials file at {CREDENTIALS_FILE}")
             flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
             creds = flow.run_local_server(port=0)
         with open(TOKEN_FILE, 'w') as token:
@@ -57,110 +70,150 @@ def authenticate_gmail_api():
 
     return build('gmail', 'v1', credentials=creds)
 
-# פונקציות Excel
+def ensure_excel_file_exists():
+    if not os.path.exists(QUESTIONS_FILE):
+        workbook = openpyxl.Workbook()
+        sheet = workbook.active
+        sheet.append(["ID", "Question", "Title", "Similar Question 1", "Similar Question 2", "Similar Question 3"])
+        workbook.save(QUESTIONS_FILE)
+
 def load_questions_from_excel():
+    ensure_excel_file_exists()
     try:
         workbook = openpyxl.load_workbook(QUESTIONS_FILE)
         sheet = workbook.active
         questions = {}
-        for row in sheet.iter_rows(min_row=2):  # דילוג על השורה הראשונה (כותרות)
+        for row in sheet.iter_rows(min_row=2):
             question_id = row[0].value
-            question_text = row[1].value
-            question_title = row[2].value
-            similar_questions = [q.value for q in row[3:] if q.value is not None]  # שאלות דומות
-            questions[question_id] = {"text": question_text, "title": question_title, "similar": similar_questions}
+            if question_id is not None:
+                questions[question_id] = {
+                    "text": row[1].value,
+                    "title": row[2].value,
+                    "similar": [q.value for q in row[3:] if q.value is not None]
+                }
         return questions
-    except FileNotFoundError:
+    except Exception as e:
+        print(f"Error loading questions from Excel: {e}")
         return {}
 
 def save_questions_to_excel(questions):
-    workbook = openpyxl.Workbook()
-    sheet = workbook.active
-    # הוספת כותרת עבור שאלות ללא דמיון
-    sheet.append(["ID", "Question", "Title", "Similar Question 1", "Similar Question 2", "Similar Question 3", "No Similar Question"])
+    try:
+        workbook = openpyxl.Workbook()
+        sheet = workbook.active
+        sheet.append(["ID", "Question", "Title", "Similar Question 1", "Similar Question 2", "Similar Question 3"])
+        
+        for question_id, data in questions.items():
+            row = [
+                question_id,
+                data["text"],
+                data["title"]
+            ] + data["similar"][:3] + [''] * (3 - len(data["similar"]))
+            sheet.append(row)
+            
+        workbook.save(QUESTIONS_FILE)
+    except Exception as e:
+        print(f"Error saving questions to Excel: {e}")
+
+def find_similar_question(question_text, questions):
+    if not question_text:
+        return None
+        
+    keywords = set(question_text.lower().split())
+    best_match = None
+    max_common_words = 0
+    
     for question_id, data in questions.items():
-        row = [question_id, data["text"], data["title"]] + data["similar"] + [data.get("no_similar", "")]
-        sheet.append(row)
-    workbook.save(QUESTIONS_FILE)
-
-# פונקציות Telegram
-
-reminders = {}  # Initialize reminders
-user_questions = {}  # מילון לשמירת הקשר בין שאלות למשתמשים
-
-def find_similar_question(question_text, questions):  # מימוש הפונקציה - התאמת מילות מפתח
-    keywords = question_text.lower().split()  # פיצול השאלה למילות מפתח
-    for question_id, data in questions.items():
-        if "text" in data:  # Check if the key exists
-            existing_keywords = data["text"].lower().split()
-            common_keywords = set(keywords) & set(existing_keywords)  # מציאת מילות מפתח משותפות
-            if len(common_keywords) > 0:  # אם יש מילות מפתח משותפות
-                return data["text"]  # החזר את השאלה הקיימת
-    return None  # אם לא נמצאה שאלה דומה
-
-async def get_question_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["question_title"] = update.message.text
-    await update.message.reply_text("שאלה התקבלה")
-    return QUESTION_TITLE
+        if not data.get("text"):
+            continue
+            
+        existing_keywords = set(data["text"].lower().split())
+        common_keywords = keywords & existing_keywords
+        
+        if len(common_keywords) > max_common_words:
+            max_common_words = len(common_keywords)
+            best_match = data["text"]
+            
+    return best_match if max_common_words >= 2 else None
 
 async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE, question_source="telegram"):
-    if context.user_data is None:
-        context.user_data = {}  # צור מילון ריק אם הוא None
+    try:
+        if not context.user_data:
+            context.user_data = {}
 
-    question_text = update.message.text if question_source == "telegram" else update["body"]
-    user_name = update.message.from_user.full_name if question_source == "telegram" else update["sender"]
-    title = context.user_data.get("question_title", question_text[:50])  # כותרת אוטומטית אם לא ניתנה
+        question_text = update.message.text if question_source == "telegram" else update["body"]
+        user_name = update.message.from_user.full_name if question_source == "telegram" else update["sender"]
+        title = context.user_data.get("question_title", question_text[:50])
 
-    service = authenticate_gmail_api()
+        service = authenticate_gmail_api()
 
-    experts_emails = [  # מלא את זה עם כתובות מייל אמיתיות!
-        "yorvada@gmail.com",
-        "nomitrapi@gmail.com",
-        "phdelazar@gmail.com",
-    ]
+        experts_emails = [
+            "yorvada@gmail.com",
+            "nomitrapi@gmail.com",
+            "phdelazar@gmail.com",
+        ]
 
-    question_subject = f"שאלה חדשה מ {user_name} ({question_source})"
-    question_body = f"שאלה: {question_text}\nכותרת: {title}"
+        # שליחת השאלה למומחים
+        question_subject = f"שאלה חדשה מ {user_name}"
+        question_body = f"""
+שאלה חדשה התקבלה:
 
-    # שמירת שאלה באקסל
-    questions = load_questions_from_excel()
-    new_question_id = max(questions.keys()) + 1 if questions else 1
-    questions[new_question_id] = {"text": question_text, "title": title, "similar": []}
+שואל: {user_name}
+מקור: {question_source}
+כותרת: {title}
 
-    # בדיקה אם יש שאלה דומה
-    similar_question = find_similar_question(question_text, questions)
-    if similar_question:
-        questions[new_question_id]["similar"].append(similar_question)
-    else:
-        questions[new_question_id]["no_similar"] = question_text
+תוכן השאלה:
+{question_text}
 
-    save_questions_to_excel(questions)
+אנא השב לשאלה זו בהקדם האפשרי.
+"""
 
-    # שמירת הקשר בין השאלה למשתמש
-    user_questions[new_question_id] = {
-        "user": user_name,
-        "source": question_source,
-        "chat_id": update.message.chat_id if question_source == "telegram" else None,
-        "email": update["sender"] if question_source == "email" else None
-    }
+        questions = load_questions_from_excel()
+        new_question_id = max(questions.keys(), default=0) + 1
+        
+        questions[new_question_id] = {
+            "text": question_text,
+            "title": title,
+            "similar": []
+        }
 
-    for expert_email in experts_emails:
-        message = create_message("yoetz10bot@gmail.com", expert_email, question_subject, question_body)
-        send_message(service, "yoetz10bot@gmail.com", message)
+        similar_question = find_similar_question(question_text, 
+            {k: v for k, v in questions.items() if k != new_question_id}
+        )
+        
+        if similar_question:
+            questions[new_question_id]["similar"].append(similar_question)
 
-        # שמירת זמן השאלה ותזכורת
-        question_time = datetime.now()
-        reminders[expert_email] = {"time": question_time, "question": question_text, "user": user_name}
+        save_questions_to_excel(questions)
 
-    await update.message.reply_text("השאלה שלך נשלחה למומחים.")
-    if question_source == "email":
-        # שליחת אישור למייל של השואל
-        reply_subject = "השאלה שלך התקבלה"
-        reply_body = "השאלה שלך התקבלה ונשלחה למומחים."
-        reply_message = create_message("yoetz10bot@gmail.com", update["sender"], reply_subject, reply_body)
-        send_message(service, "yoetz10bot@gmail.com", reply_message)
+        user_questions[new_question_id] = {
+            "user": user_name,
+            "source": question_source,
+            "chat_id": update.message.chat_id if question_source == "telegram" else None,
+            "email": update["sender"] if question_source == "email" else None,
+            "text": question_text
+        }
 
-    return ConversationHandler.END  # סיום שיחה בטלגרם
+        for expert_email in experts_emails:
+            message = create_message(
+                "yoetz10bot@gmail.com",
+                expert_email,
+                question_subject,
+                question_body
+            )
+            send_message(service, "yoetz10bot@gmail.com", message)
+            reminders[expert_email] = {
+                "time": datetime.now(),
+                "question": question_text,
+                "user": user_name
+            }
+
+        await update.message.reply_text("השאלה שלך נשלחה למומחים. תקבל תשובה בקרוב.")
+        return ConversationHandler.END
+
+    except Exception as e:
+        print(f"Error in handle_question: {e}")
+        await update.message.reply_text("אירעה שגיאה בעת שליחת השאלה. אנא נסה שוב מאוחר יותר.")
+        return ConversationHandler.END
 
 async def check_for_answers(context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -175,64 +228,71 @@ async def check_for_answers(context: ContextTypes.DEFAULT_TYPE):
 
             sender_email = mime_msg['From']
             subject = mime_msg['Subject']
-            body = mime_msg.get_payload()
+            
+            # קבלת תוכן ההודעה
+            if mime_msg.is_multipart():
+                for part in mime_msg.walk():
+                    if part.get_content_type() == 'text/plain':
+                        body = part.get_payload(decode=True).decode()
+                        break
+            else:
+                body = mime_msg.get_payload(decode=True).decode()
 
-            # ניפוי שגיאות: הדפסת פרטי המייל
-            print(f"New email received - From: {sender_email}, Subject: {subject}")
-
-            # בדיקה אם המייל הוא תשובה לשאלה
-            if "תשובה" in subject or "Re:" in subject:  # ניתן לשפר את הלוגיקה כאן
-                # חילוץ השאלה המקורית מהמייל
-                original_question = extract_original_question(body)  # פונקציה שתחלץ את השאלה המקורית מהתשובה
-                
+            if "תשובה" in subject or "Re:" in subject:
+                original_question = extract_original_question(body)
                 if original_question:
-                    print(f"Extracted original question: {original_question}")
-                    
-                    # מציאת המשתמש שהגיש את השאלה
-                    user_to_notify = find_user_by_question(original_question)  # פונקציה שתמצא את המשתמש לפי השאלה
+                    user_to_notify = find_user_by_question(original_question)
                     
                     if user_to_notify:
-                        print(f"User to notify: {user_to_notify}")
+                        # הסרת הציטוט המקורי מהתשובה
+                        answer = clean_reply_text(body)
                         
-                        # שליחת התשובה למשתמש
                         if user_to_notify["source"] == "telegram":
-                            await context.bot.send_message(chat_id=user_to_notify["chat_id"], text=f"קיבלת תשובה לשאלתך:\n{body}")
-                            print("Answer sent to user via Telegram.")
-                        else:  # אם המשתמש הוא במייל
-                            reply_subject = "תשובה לשאלתך"
-                            reply_body = f"קיבלת תשובה לשאלתך:\n{body}"
-                            reply_message = create_message("yoetz10bot@gmail.com", user_to_notify["email"], reply_subject, reply_body)
+                            try:
+                                await context.bot.send_message(
+                                    chat_id=user_to_notify["chat_id"],
+                                    text=f"קיבלת תשובה לשאלתך:\n\n{answer}"
+                                )
+                            except Exception as e:
+                                print(f"Error sending Telegram message: {e}")
+                        else:
+                            reply_message = create_message(
+                                "yoetz10bot@gmail.com",
+                                user_to_notify["email"],
+                                "תשובה לשאלתך",
+                                f"קיבלת תשובה לשאלתך:\n\n{answer}"
+                            )
                             send_message(service, "yoetz10bot@gmail.com", reply_message)
-                            print("Answer sent to user via email.")
-                    else:
-                        print("User not found for the question.")
-                else:
-                    print("Could not extract the original question from the email.")
 
-                # סימון המייל כנקרא
-                service.users().messages().modify(userId='me', id=message['id'], body={'removeLabelIds': ['UNREAD']}).execute()
-                print("Email marked as read.")
-            else:
-                print("Email is not a reply to a question.")
+            # סימון המייל כנקרא
+            service.users().messages().modify(
+                userId='me',
+                id=message['id'],
+                body={'removeLabelIds': ['UNREAD']}
+            ).execute()
 
     except Exception as e:
         print(f"Error in check_for_answers: {e}")
-        import traceback
-        traceback.print_exc()
 
 def extract_original_question(body):
-    # פונקציה לדוגמה לחילוץ השאלה המקורית מהתשובה
-    # ניתן לשפר את הלוגיקה כאן בהתאם לפורמט המייל
     lines = body.split("\n")
     for line in lines:
         if "שאלה:" in line:
             return line.replace("שאלה:", "").strip()
     return None
 
+def clean_reply_text(body):
+    # הסרת ציטוטים וחתימות
+    lines = body.split("\n")
+    clean_lines = []
+    for line in lines:
+        if not line.startswith(">") and not line.startswith("On") and not line.startswith("From:"):
+            clean_lines.append(line)
+    return "\n".join(clean_lines).strip()
+
 def find_user_by_question(question_text):
-    # מציאת המשתמש לפי השאלה
     for question_id, data in user_questions.items():
-        if data["text"] == question_text:
+        if data.get("text") == question_text:
             return data
     return None
 
@@ -240,77 +300,107 @@ async def send_reminders(context: ContextTypes.DEFAULT_TYPE):
     try:
         service = authenticate_gmail_api()
         now = datetime.now()
+        reminders_to_delete = []
+
         for expert, reminder in reminders.items():
-            if now - reminder["time"] > timedelta(days=1):  # אם עבר יותר מיום
+            if now - reminder["time"] > timedelta(days=1):
                 reminder_subject = "תזכורת: שאלה ממתינה לתשובה"
-                reminder_body = f"שלום {expert},\nתזכורת: שאלה ממתינה לתשובה:\n{reminder['question']}\n\nמשתמש: {reminder['user']}"
-                reminder_message = create_message("yoetz10bot@gmail.com", expert, reminder_subject, reminder_body)
-                send_message(service, "yoetz10bot@gmail.com", reminder_message)
-                del reminders[expert]  # מחיקת התזכורת לאחר שליחה
+                reminder_body = f"""
+שלום,
+
+זוהי תזכורת אוטומטית לשאלה שטרם נענתה:
+
+שואל: {reminder['user']}
+שאלה: {reminder['question']}
+
+אנא השב בהקדם האפשרי.
+
+בברכה,
+מערכת יועץ
+"""
+                message = create_message(
+                    "yoetz10bot@gmail.com",
+                    expert,
+                    reminder_subject,
+                    reminder_body
+                )
+                send_message(service, "yoetz10bot@gmail.com", message)
+                reminders_to_delete.append(expert)
+
+        for expert in reminders_to_delete:
+            del reminders[expert]
+
     except Exception as e:
         print(f"Error in send_reminders: {e}")
-        import traceback
-        traceback.print_exc()
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("שלום! שלח/י את השאלה שלך.")
+    await update.message.reply_text(
+        "ברוך הבא ליועץ! אנא שלח את השאלה שלך ואעביר אותה למומחים שלנו."
+    )
     return QUESTION
 
+async def get_question_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["question_title"] = update.message.text
+    await update.message.reply_text("תודה! השאלה התקבלה ותועבר למומחים שלנו.")
+    return await handle_question(update, context)
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("הפעולה בוטלה.")
+    await update.message.reply_text("הפעולה בוטלה. אתה יכול להתחיל מחדש עם /start")
     return ConversationHandler.END
 
 async def main():
-    BOT_TOKEN = os.environ.get("BOT_TOKEN")  # קבל טוקן ממשתנה סביבה
-    if not BOT_TOKEN:
-        raise ValueError("BOT_TOKEN environment variable not set.")
-
-    application = Application.builder().token(BOT_TOKEN).build()
-
-    # ה-Conversation Handler
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
-        states={
-            QUESTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_question_title)],
-            QUESTION_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_question)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-    application.add_handler(conv_handler)
-
-    # תזמון משימות (check_emails ו-send_reminders)
-    application.job_queue.run_repeating(check_for_answers, interval=timedelta(minutes=10))
-    application.job_queue.run_repeating(send_reminders, interval=timedelta(hours=24))
-
     try:
-        print("מפעיל את הבוט...")
-        # הפעלת הבוט
+        # טעינת טוקן הבוט ממשתנה סביבה
+        BOT_TOKEN = os.getenv("BOT_TOKEN")
+        if not BOT_TOKEN:
+            raise ValueError("Missing BOT_TOKEN in environment variables")
+
+        # יצירת אפליקציית הבוט
+        application = Application.builder().token(BOT_TOKEN).build()
+
+        # הגדרת ה-Conversation Handler
+        conv_handler = ConversationHandler(
+            entry_points=[CommandHandler("start", start)],
+            states={
+                QUESTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_question_title)],
+                QUESTION_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_question)]
+            },
+            fallbacks=[CommandHandler("cancel", cancel)]
+        )
+        application.add_handler(conv_handler)
+
+        # הגדרת משימות מתוזמנות
+        application.job_queue.run_repeating(check_for_answers, interval=300)  # כל 5 דקות
+        application.job_queue.run_repeating(send_reminders, interval=86400)   # כל
+        
+        print("Starting bot...")
+        # איתחול והפעלת הבוט
         await application.initialize()
         await application.start()
-        await application.updater.start_polling()  # התחל להאזין להודעות
-        while True:  # לולאה אינסופית כדי להשאיר את הבוט פעיל
-            await asyncio.sleep(1)  # המתן לשנייה אחת לפני הבדיקה הבאה
-    except Exception as e:  # טיפול בשגיאות
-        print(f"שגיאה במהלך הפעלת הבוט: {e}")
-        import traceback
-        traceback.print_exc()  # הדפסת עקבות השגיאה
-    finally:
-        # סגירה נכונה של הבוט
-        await application.updater.stop()  # עצור את ה-Updater
-        await application.stop()
-        await application.shutdown()
-        print("הבוט נסגר בצורה תקינה.")
+        await application.updater.start_polling()
+
+        print("Bot is running...")
+        
+        try:
+            # לולאה אינסופית לשמירת הבוט פעיל
+            while True:
+                await asyncio.sleep(1)
+        except Exception as e:
+            print(f"Error in main loop: {e}")
+        finally:
+            # סגירה מסודרת של הבוט
+            print("Shutting down...")
+            await application.updater.stop()
+            await application.stop()
+            await application.shutdown()
 
 if __name__ == '__main__':
-    QUESTION = range(1)
-    QUESTION_TITLE = range(1)
-
     try:
-        # הפעלת הפונקציה הראשית באמצעות asyncio
+        # הפעלת הפונקציה הראשית
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\nהבוט נעצר על ידי המשתמש")
+        print("\nBot stopped by user")
     except Exception as e:
-        print(f"שגיאה קריטית: {e}")
+        print(f"Critical error: {e}")
         import traceback
         traceback.print_exc()
